@@ -59,6 +59,11 @@
 - 已导入会话不会因插件版本升级而自动重导（幂等水印保护）。如需用新映射全量重导：停止插件 → 删除 `~/.dsh/sessions` 下 `codex-*` 目录 → 重新激活。
 - 文本/工具输出有单条上限（消息 120K 字符、工具输出 200K 字符），超长内容会以"…[内容已截断]"标记。
 
+## 相关资源
+
+- DeepSeek Harness 官方仓库：<https://github.com/deepseek-ai/DeepSeek-Harness>
+- DSH 开发者社区：官方企微群（扫码添加企微小助手并填写[入群问卷](https://trtgsjkv6r.feishu.cn/share/base/form/shrcnIt5twSVdLGD52KJBckGCgg)，完成后小助手会邀请入群）
+
 ## License
 
 MIT
