@@ -1,5 +1,7 @@
 # dsh-plugin · codex-import
 
+> English docs: [README.en.md](./README.en.md)
+
 **Codex（ChatGPT）对话自动导入插件** —— 为 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai) 编写的动态 Cordis 插件，自动把本机 Codex 桌面版/CLI 的会话记录（`~/.codex`）导入为 DSH 持久化会话，并按项目目录挂载到对应工作区。
 
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) ![dsh](https://img.shields.io/badge/DSH-dynamic%20cordis%20plugin-blue)
