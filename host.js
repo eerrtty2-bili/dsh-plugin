@@ -1,7 +1,14 @@
 // ============================================================================
-// Codex (ChatGPT) conversation auto-importer 鈥?HOST half (pkg-13)
-// Streaming window reads (no size cap), thread-aware merging, live-session
-// skip, self-healing append conflicts, cross-platform paths.
+// Codex (ChatGPT) conversation auto-importer — HOST half (v15)
+// - auto-discovers ~/.codex, scans sessions/archived_sessions/rollouts
+// - thread-aware merging of segmented rollout files into one session
+// - streaming chunked reads (no file-size cap)
+// - incremental watermark sync every 30s (codex/import events)
+// - projection warm-up + dirty-title repair for the sidebar
+// - filters system-injected messages; skips sessions with no real user input
+// - remembers deleted imports (ignored state file) so they are not re-created
+// - tool_search / mcp / patch / function / custom tool mapping
+// - live-session protection and self-healing append conflicts
 // ============================================================================
 const SEP = /[\\/]+/;
 const dirname = (p) => {
@@ -21,7 +28,27 @@ const join = (a, b) => {
 const isAbsolute = (p) => typeof p === 'string' && (/^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/') || p.startsWith('\\'));
 
 const MAX_RECORDS_PER_PASS = 30000;
-const MAPPER_VERSION = 5;
+const MAPPER_VERSION = 6;
+const STATE_FILE = 'codex-import-state.json';
+
+const SYSTEM_INJECT_MARKERS = [
+  '<app-context>', '<permissions instructions>', '<skills_instructions>', '<recommended_plugins>',
+  '<environment_context>', '<ide_opened_file>', '<collaboration_mode>', '<apps_instructions>',
+  '<plugins_instructions>', '<multi_agent_mode>', '<task_instructions>', '<user_instructions>',
+  'The following is the Codex agent history', '# Files mentioned by the user',
+];
+const isSystemInjected = (text) => {
+  const t = typeof text === 'string' ? text.trim() : '';
+  if (!t) return true;
+  for (const m of SYSTEM_INJECT_MARKERS) if (t.startsWith(m)) return true;
+  return false;
+};
+const filenameTitle = (path) => {
+  const base = basename(path).replace(/\.jsonl$/i, '');
+  const m = /rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})/.exec(base);
+  if (m) return 'Codex ' + m[1] + ' ' + m[2] + ':' + m[3];
+  return base;
+};
 
 const hashing = (s) => {
   let h = 5381;
@@ -33,7 +60,7 @@ const sanitizeId = (s) => String(s).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^
 const capText = (s, max) => {
   const t = typeof s === 'string' ? s : String(s);
   if (t.length <= max) return t;
-  return t.slice(0, max) + '\n鈥鍐呭宸叉埅鏂璢';
+  return t.slice(0, max) + '\n…[内容已截断]';
 };
 const parseTimestamp = (v) => {
   if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v;
@@ -60,14 +87,14 @@ const extractMcpResult = (result) => {
     }
     return String(ok);
   }
-  if (Object.hasOwn(result, 'Err')) return '閿欒: ' + String(result.Err);
+  if (Object.hasOwn(result, 'Err')) return '错误: ' + String(result.Err);
   try { return JSON.stringify(result); } catch (e) { return String(result); }
 };
 const summarizeChanges = (changes) => {
   if (!changes || typeof changes !== 'object') return '';
   const names = Object.keys(changes);
   if (names.length === 0) return '';
-  return '鏀瑰姩鏂囦欢: ' + names.join(', ');
+  return '改动文件: ' + names.join(', ');
 };
 
 return {
@@ -92,6 +119,8 @@ return {
       files: new Map(),
       fileIds: new Map(),
       watermarkCache: new Map(),
+      pathById: new Map(),
+      mem: { seen: [], ignored: new Set(), loaded: false, maintained: new Set() },
     };
 
     const pushError = (entry) => {
@@ -99,33 +128,55 @@ return {
       if (state.errors.length > 30) state.errors.shift();
     };
 
+    async function dshHome() {
+      try {
+        const docPath = settings.documentPath;
+        if (typeof docPath === 'string' && docPath.length > 0) return dirname(docPath);
+      } catch (e) { /* ignore */ }
+      return null;
+    }
+    async function loadState() {
+      if (state.mem.loaded) return;
+      state.mem.loaded = true;
+      try {
+        const home = await dshHome();
+        if (!home) return;
+        const target = await fs.resolve(join(home, STATE_FILE));
+        const info = await fs.stat(target);
+        if (!info || info.type !== 'file') return;
+        const o = JSON.parse(await fs.readText(target));
+        if (o && Array.isArray(o.seen)) state.mem.seen = o.seen.filter((x) => typeof x === 'string');
+        if (o && Array.isArray(o.ignored)) for (const id of o.ignored) if (typeof id === 'string') state.mem.ignored.add(id);
+      } catch (e) { /* no state yet */ }
+    }
+    async function saveState() {
+      try {
+        const home = await dshHome();
+        if (!home) return;
+        const target = await fs.resolve(join(home, STATE_FILE));
+        await fs.writeText(target, JSON.stringify({ version: 1, seen: state.mem.seen, ignored: [...state.mem.ignored] }));
+      } catch (e) {
+        console.log('codex saveState failed:', String((e && e.message) || e));
+      }
+    }
+
     async function deriveCodexRoot() {
       if (state.manualRoot) return state.codexRoot;
       let home = null;
       try {
         const docPath = settings.documentPath;
-        console.log('codex derive: settings.documentPath =', String(docPath));
         if (typeof docPath === 'string' && docPath.length > 0) {
           home = dirname(dirname(docPath));
         }
-      } catch (e) {
-        console.log('codex derive: settings.documentPath error', String(e));
-      }
-      console.log('codex derive: home =', String(home));
+      } catch (e) { /* ignore */ }
       const candidates = [];
       if (home) candidates.push(join(home, '.codex'));
       for (const c of candidates) {
         try {
           const target = await fs.resolve(c);
           const info = await fs.stat(target);
-          if (info && info.type === 'directory') {
-            console.log('codex derive: found root', c);
-            return c;
-          }
-          console.log('codex derive: candidate not a directory', c, info && info.type);
-        } catch (e) {
-          console.log('codex derive: candidate error', c, String(e));
-        }
+          if (info && info.type === 'directory') return c;
+        } catch (e) { /* candidate absent */ }
       }
       return candidates[0] || null;
     }
@@ -140,7 +191,6 @@ return {
           await walkDir(dirTarget, out, 0);
         } catch (e) { /* directory missing */ }
       }
-      console.log('codex collect: found', out.length, 'jsonl files');
       return out;
     }
     async function walkDir(target, out, depth) {
@@ -199,6 +249,7 @@ return {
       for (const [id, list] of byId) {
         list.sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
         groups.push({ id, files: list });
+        if (id) state.pathById.set(id, list[0].path);
       }
       return groups;
     }
@@ -472,7 +523,10 @@ return {
             const p = record.payload || {};
             if (p.type === 'message') {
               if (p.role === 'assistant') emitAssistant(textFromBlocks(p.content), p.id, null, null, undefined);
-              else if (p.role === 'user' && !meta.useEventUserMessages) emitUser(textFromBlocks(p.content), p.id, undefined, false);
+              else if (p.role === 'user' && !meta.useEventUserMessages) {
+                const tx = textFromBlocks(p.content);
+                if (!isSystemInjected(tx)) emitUser(tx, p.id, undefined, false);
+              }
             } else if (p.type === 'agent_message') {
               emitAssistant(textFromBlocks(p.content), p.id, null, null, undefined);
             } else if (p.type === 'reasoning') {
@@ -484,6 +538,10 @@ return {
             } else if (p.type === 'custom_tool_call') {
               emitToolCall(p.name, p.input, p.call_id);
             } else if (p.type === 'custom_tool_call_output') {
+              enqueueResult(p.call_id, p.output || '');
+            } else if (p.type === 'tool_search_call') {
+              emitToolCall('tool_search', p.arguments, p.call_id);
+            } else if (p.type === 'tool_search_output') {
               enqueueResult(p.call_id, p.output || '');
             }
             continue;
@@ -520,9 +578,61 @@ return {
       return events.map((e, i) => Object.assign({}, e, { seq: baseSeq + i }));
     }
 
+    async function warmProjection(sessionId) {
+      try {
+        const projCache = ctx.get('sessionProjectionCache');
+        const store = ctx.get('sessions');
+        if (projCache === undefined || store === undefined || typeof projCache.write !== 'function' || typeof store.prepare !== 'function') return;
+        const inspected = await persistence.inspect(sessionId);
+        const meta = {};
+        if (inspected.meta && typeof inspected.meta.cwd === 'string') meta.cwd = inspected.meta.cwd;
+        if (inspected.meta && typeof inspected.meta.createdAt === 'number') meta.createdAt = inspected.meta.createdAt;
+        const session = store.prepare(sessionId, { seed: inspected.events, meta });
+        await projCache.write(session);
+        console.log('codex projection warmed:', sessionId);
+      } catch (e) {
+        console.log('codex warm projection failed:', sessionId, String((e && e.message) || e));
+      }
+    }
+
+    async function maintainExisting(sessionId, titles) {
+      if (state.mem.maintained.has(sessionId)) return;
+      state.mem.maintained.add(sessionId);
+      try {
+        let inspected;
+        try { inspected = await persistence.inspect(sessionId); } catch (e) { return; }
+        let currentTitle = null;
+        for (const e of inspected.events) if (e.type === 'session/title') currentTitle = e.data.title;
+        const dirty = currentTitle === null || isSystemInjected(String(currentTitle)) || !String(currentTitle || '').trim();
+        if (dirty) {
+          let firstUser = null;
+          for (const e of inspected.events) {
+            if (e.type === 'user/message' && Array.isArray(e.data.content)) {
+              const tx = textFromBlocks(e.data.content);
+              if (!isSystemInjected(tx)) { firstUser = tx; break; }
+            }
+          }
+          const groupId = sessionId.startsWith('codex-') ? sessionId.slice(6) : null;
+          const title = capText(String(firstUser || (groupId && titles.get(groupId)) || filenameTitle(state.pathById.get(sessionId) || sessionId)).replace(/\s+/g, ' ').trim(), 80);
+          if (title && title !== currentTitle) {
+            await persistence.append(sessionId, [{ type: 'session/title', seq: inspected.events.length, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } }]);
+            console.log('codex title fixed:', sessionId, '->', title.slice(0, 40));
+          }
+        }
+        await warmProjection(sessionId);
+      } catch (e) {
+        console.log('codex maintain failed:', sessionId, String((e && e.message) || e));
+      }
+    }
+
     async function importThread(group, titles, report) {
       const files = group.files;
       const sessionId = 'codex-' + (group.id ? sanitizeId(group.id) : 'file-' + sanitizeId(basename(files[0].path).replace(/\.jsonl$/i, '')));
+
+      if (state.mem.ignored.has(sessionId)) {
+        report.skipped++;
+        return null;
+      }
 
       try {
         const liveStore = ctx.get('sessions');
@@ -620,11 +730,19 @@ return {
         return null;
       }
 
+      if (wasNew && !events.some((e) => e.type === 'user/message')) {
+        entry.fi = finalFi;
+        entry.line = finalLine;
+        state.watermarkCache.set(sessionId, entry);
+        report.skipped++;
+        return null;
+      }
+
       const baseSeq = entry.exists ? entry.nextSeq : 0;
       const seqd = buildEvents(events, baseSeq);
       let title = null;
       if (wasNew) {
-        title = (group.id && titles.get(group.id)) || firstUserText || basename(files[0].path).replace(/\.jsonl$/i, '');
+        title = (group.id && titles.get(group.id)) || firstUserText || filenameTitle(files[0].path);
         title = capText(String(title || '').replace(/\s+/g, ' ').trim(), 80);
         if (title) {
           seqd.push({ type: 'session/title', seq: baseSeq + seqd.length, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } });
@@ -658,6 +776,8 @@ return {
       entry.line = finalLine;
       state.watermarkCache.set(sessionId, entry);
 
+      if (wasNew) await warmProjection(sessionId);
+
       if (meta && isAbsolute(meta.cwd) && workspaceRegistry !== undefined) {
         try {
           const ws = await workspaceRegistry.create(meta.cwd);
@@ -678,11 +798,11 @@ return {
           const root = await deriveCodexRoot();
           state.codexRoot = root;
           if (!root) {
-            state.lastError = '鏈壘鍒?Codex 鏁版嵁鐩綍锛堥粯璁?~/.codex锛夈€傚彲鍦ㄤ笅鏂硅緭鍏ヨ矾寰勫悗鐐瑰嚮鈥滃簲鐢ㄢ€濄€?;
-            console.log('codex scan: no root found');
+            state.lastError = '未找到 Codex 数据目录（默认 ~/.codex）。可在下方输入路径后点击“应用”。';
             return;
           }
           console.log('codex scan start:', root);
+          await loadState();
           const files = await collectSessionFiles(root);
           const groups = await groupThreads(files);
           const titles = await loadThreadTitles(root);
@@ -699,6 +819,16 @@ return {
               console.log('codex import error:', group.id, msg);
             }
           }
+          try {
+            const codexIds = (await persistence.list()).map((h) => h.id).filter((id) => typeof id === 'string' && id.startsWith('codex-'));
+            for (const prev of state.mem.seen) if (!codexIds.includes(prev)) state.mem.ignored.add(prev);
+            state.mem.seen = codexIds;
+            await saveState();
+            for (const id of codexIds) {
+              if (state.mem.ignored.has(id)) continue;
+              try { await maintainExisting(id, titles); } catch (e) { /* per-session fail-soft */ }
+            }
+          } catch (e) { /* fail-soft */ }
           state.recent = report.recent.slice(0, 20);
           state.lastScan = report;
           state.lastScanAt = Date.now();
@@ -724,11 +854,19 @@ return {
         lastError: state.lastError,
         errors: state.errors.slice(-10),
         totalFiles: state.lastScan ? state.lastScan.scanned : null,
+        ignoredCount: state.mem.ignored.size,
       };
     }
 
     ctx.effect(() => harness.handle('codex.status', async () => buildReport()));
     ctx.effect(() => harness.handle('codex.scan', async () => { await scanOnce(); return buildReport(); }));
+    ctx.effect(() => harness.handle('codex.forget', async () => {
+      await loadState();
+      state.mem.ignored.clear();
+      await saveState();
+      await scanOnce();
+      return buildReport();
+    }));
     ctx.effect(() => harness.handle('codex.setRoot', async (args) => {
       const p = args && typeof args.path === 'string' ? args.path.trim() : '';
       if (p) {
@@ -739,11 +877,11 @@ return {
             state.codexRoot = target.displayPath || p;
             state.manualRoot = true;
           } else {
-            state.lastError = '璺緞涓嶆槸鐩綍: ' + p;
+            state.lastError = '路径不是目录: ' + p;
             return buildReport();
           }
         } catch (e) {
-          state.lastError = '璺緞涓嶅彲鐢? ' + p;
+          state.lastError = '路径不可用: ' + p;
           return buildReport();
         }
       } else {
@@ -754,10 +892,10 @@ return {
       return buildReport();
     }));
 
-    // ---- model-visible tools: query / trigger the import ----
+    // ---- model-visible tools ----
     const statusTool = harness.defineTool({
       name: 'codex_import_status',
-      description: '鏌ョ湅 Codex 瀵硅瘽鑷姩瀵煎叆鎻掍欢鐨勭姸鎬侊細鏁版嵁婧愩€佷笂娆℃壂鎻忕粨鏋滐紙鏂板鍏?鏇存柊/璺宠繃/閿欒锛夈€佹渶杩戝鍏ョ殑浼氳瘽涓庨敊璇垪琛ㄣ€?,
+      description: '查看 Codex 对话自动导入插件的状态：数据源、上次扫描结果（新导入/更新/跳过/错误）、最近导入的会话与错误列表。',
       parameters: { type: 'object', properties: {} },
       output: {
         schema: { type: 'object', additionalProperties: true },
@@ -772,7 +910,7 @@ return {
     ctx.effect(() => harness.registerTool(ctx, statusTool));
     const scanTool = harness.defineTool({
       name: 'codex_import_now',
-      description: '绔嬪嵆鎵ц涓€娆?Codex 浼氳瘽鎵弿瀵煎叆锛屽苟杩斿洖鎵弿鎶ュ憡锛堟柊瀵煎叆/鏇存柊/璺宠繃/閿欒鏁颁笌鏈€杩戝鍏ュ垪琛級銆?,
+      description: '立即执行一次 Codex 会话扫描导入，并返回扫描报告（新导入/更新/跳过/错误数与最近导入列表）。',
       parameters: { type: 'object', properties: {} },
       output: {
         schema: { type: 'object', additionalProperties: true },
@@ -786,6 +924,25 @@ return {
       },
     });
     ctx.effect(() => harness.registerTool(ctx, scanTool));
+    const forgetTool = harness.defineTool({
+      name: 'codex_import_forget',
+      description: '清空“已忽略”列表（用户删除过的导入会话），允许它们被重新导入，并立即执行一次扫描。',
+      parameters: { type: 'object', properties: {} },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render(args, value) {
+          return [{ type: 'text', text: JSON.stringify(value, null, 2) }];
+        },
+      },
+      async execute() {
+        await loadState();
+        state.mem.ignored.clear();
+        await saveState();
+        await scanOnce();
+        return buildReport();
+      },
+    });
+    ctx.effect(() => harness.registerTool(ctx, forgetTool));
 
     const runScan = () => scanOnce().catch((e) => { state.lastError = String((e && e.message) || e); });
     ctx.effect(() => timer.timeout(runScan, 600));

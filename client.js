@@ -1,5 +1,5 @@
 // ============================================================================
-// Codex auto-importer 鈥?CLIENT half: control panel inside the cordis_run card.
+// Codex auto-importer — CLIENT half: control panel inside the cordis_run card.
 // ============================================================================
 return {
   inject: ['timer'],
@@ -36,6 +36,7 @@ return {
         };
         const doScan = () => run(() => host.call('codex.scan', {}));
         const doSetRoot = () => run(() => host.call('codex.setRoot', { path: root }));
+        const doForget = () => run(() => host.call('codex.forget', {}));
 
         const s = status || {};
         const lastScan = s.lastScan || null;
@@ -50,37 +51,42 @@ return {
 
         const files = s.totalFiles;
         return React.createElement('div', { style },
-          React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Codex 瀵硅瘽鑷姩瀵煎叆'),
+          React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Codex 对话自动导入'),
           React.createElement('div', { style: row },
-            '鏁版嵁婧? ',
-            React.createElement('code', { style: { wordBreak: 'break-all' } }, s.codexRoot || '鈥?),
-            s.manualRoot ? React.createElement('span', { style: muted }, ' (鎵嬪姩)') : null,
+            '数据源: ',
+            React.createElement('code', { style: { wordBreak: 'break-all' } }, s.codexRoot || '…'),
+            s.manualRoot ? React.createElement('span', { style: muted }, ' (手动)') : null,
           ),
           React.createElement('div', { style: row },
-            React.createElement('span', { style: badge }, s.scanning ? '鎵弿涓€? : '寰呮満'),
-            s.lastScanAt ? ' 涓婃鎵弿 ' + new Date(s.lastScanAt).toLocaleTimeString() : '',
-            lastScan ? (' 路 鏂板鍏?' + lastScan.created + ' 路 鏇存柊 ' + lastScan.updated + ' 路 璺宠繃 ' + lastScan.skipped + ' 路 閿欒 ' + lastScan.errors) : '',
-            files !== undefined ? React.createElement('span', { style: muted }, ' (鎵弿 ' + files + ' 涓枃浠?/ ' + (lastScan ? lastScan.threads : '?') + ' 涓嚎绋?') : null,
+            React.createElement('span', { style: badge }, s.scanning ? '扫描中…' : '待机'),
+            s.lastScanAt ? ' 上次扫描 ' + new Date(s.lastScanAt).toLocaleTimeString() : '',
+            lastScan ? (' · 新导入 ' + lastScan.created + ' · 更新 ' + lastScan.updated + ' · 跳过 ' + lastScan.skipped + ' · 错误 ' + lastScan.errors) : '',
+            files !== undefined ? React.createElement('span', { style: muted }, ' (扫描 ' + files + ' 个文件 / ' + (lastScan ? lastScan.threads : '?') + ' 个线程)') : null,
+            s.ignoredCount ? React.createElement('span', { style: muted }, ' · 已忽略 ' + s.ignoredCount) : null,
           ),
           s.lastError ? React.createElement('div', { style: { ...err, marginTop: 4 } }, String(s.lastError)) : null,
           recent.length > 0 ? React.createElement('div', { style: { ...row, marginTop: 6 } },
-            React.createElement('div', { style: muted }, '鏈€杩戝鍏?'),
+            React.createElement('div', { style: muted }, '最近导入:'),
             recent.map((it) => React.createElement('div', { key: it.id, style: row },
-              '鈥?',
+              '• ',
               React.createElement('span', { style: { fontWeight: 500 } }, it.title || it.id),
-              React.createElement('span', { style: muted }, ' (' + (it.kind === 'created' ? '鏂板缓' : '鏇存柊') + ' ' + it.count + ' 鏉?'),
+              React.createElement('span', { style: muted }, ' (' + (it.kind === 'created' ? '新建' : '更新') + ' ' + it.count + ' 条)'),
             )),
           ) : null,
           React.createElement('div', { style: { ...row, display: 'flex', gap: 6, marginTop: 8 } },
             React.createElement('input', {
               value: root,
               onChange: (e) => setRoot(e.target.value),
-              placeholder: 'Codex 鐩綍锛堥粯璁?~/.codex锛?,
+              placeholder: 'Codex 目录（默认 ~/.codex）',
               style: input,
             }),
-            React.createElement('button', { onClick: doSetRoot, disabled: busy, style: btn }, '搴旂敤'),
-            React.createElement('button', { onClick: doScan, disabled: busy, style: btn }, busy ? '鈥? : '绔嬪嵆鎵弿'),
+            React.createElement('button', { onClick: doSetRoot, disabled: busy, style: btn }, '应用'),
+            React.createElement('button', { onClick: doScan, disabled: busy, style: btn }, busy ? '…' : '立即扫描'),
           ),
+          s.ignoredCount ? React.createElement('div', { style: { ...row, display: 'flex', gap: 6 } },
+            React.createElement('span', { style: { ...muted, flex: 1 } }, '已忽略 ' + s.ignoredCount + ' 个被删除的会话，不再重新导入'),
+            React.createElement('button', { onClick: doForget, disabled: busy, style: btn }, '恢复全部'),
+          ) : null,
         );
       },
     ));

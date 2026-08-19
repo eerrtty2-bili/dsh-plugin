@@ -15,11 +15,13 @@
 - **线程感知合并**：Codex 桌面版对同一线程的续写会拆成多个 rollout 文件（各段首尾衔接）。插件按线程 id 分组、按时间排序后合并导入**一个** DSH 会话，保证完整、最新。
 - **流式分块导入**：逐行流式解析（`fs.streamText`），每轮最多处理 3 万条记录 —— **任意大小文件**（包括数百 MB 的会话）都能分块导入，内存占用恒定有界。
 - **增量续导（自动）**：每 30 秒自动扫描；以 `codex/import` 水印事件记录进度（文件索引 + 行号），只追加新内容；运行中的 Codex 会话边写边导，最长延迟一个扫描周期。
-- **事件映射保真**：用户/助手消息（含 reasoning 思维链）、`function_call` / `custom_tool_call` / `mcp_tool_call_end` / `patch_apply_end` / 命令执行 → 标准 DSH 会话事件（turn/step/tool 结构，surfaceOp 合法）。
+- **事件映射保真**：用户/助手消息（含 reasoning 思维链）、`function_call` / `custom_tool_call` / `tool_search` / `mcp_tool_call_end` / `patch_apply_end` / 命令执行 → 标准 DSH 会话事件（turn/step/tool 结构，surfaceOp 合法）。
+- **侧边栏标题修复**：自动写入投影缓存（projection warm-up）并过滤系统注入消息（`<recommended_plugins>`、`The following is the Codex agent history`、`# Files mentioned by the user` 等）——侧边栏显示真实对话标题，不再出现空标题/乱码目录名。
+- **删除记忆**：用户删除过的导入会话会被自动记住（`codex-import-state.json`），不再重复导入；面板/`codex_import_forget` 可一键"恢复全部"。
 - **按项目挂载工作区**：会话 `cwd` → 自动创建/复用 DSH 工作区并挂载会话，左侧栏按项目浏览。
 - **Live 会话保护**：被用户在 DSH 里打开/继续（被 agent loop 接管）的导入会话自动放行，避免与活跃写入冲突。
-- **控制面板**：Run 卡片内显示数据源、扫描统计、最近导入，支持手动指定目录与"立即扫描"。
-- **模型工具**：`codex_import_status` / `codex_import_now` —— 随时查询状态或触发扫描。
+- **控制面板**：Run 卡片内显示数据源、扫描统计、最近导入、已忽略数量，支持手动指定目录、"立即扫描"与"恢复全部"。
+- **模型工具**：`codex_import_status` / `codex_import_now` / `codex_import_forget` —— 查询状态、触发扫描、恢复被忽略的会话。
 
 ## 安装 / 运行
 
