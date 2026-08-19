@@ -1,14 +1,14 @@
 // ============================================================================
-// Codex (ChatGPT) conversation auto-importer — HOST half (v15)
-// - auto-discovers ~/.codex, scans sessions/archived_sessions/rollouts
-// - thread-aware merging of segmented rollout files into one session
-// - streaming chunked reads (no file-size cap)
-// - incremental watermark sync every 30s (codex/import events)
-// - projection warm-up + dirty-title repair for the sidebar
-// - filters system-injected messages; skips sessions with no real user input
-// - remembers deleted imports (ignored state file) so they are not re-created
-// - tool_search / mcp / patch / function / custom tool mapping
-// - live-session protection and self-healing append conflicts
+// Codex (ChatGPT) conversation auto-importer — HOST half (v23, final)
+// - per-file watermarks: every rollout file of a thread keeps its own consumed
+//   line count; every scan checks EVERY file for growth (Codex appends new
+//   turns to older rollout files)
+// - streaming split() reads: 400MB+ files parse in linear time
+// - ghost persistence cursors (created but never materialized) are recovered
+//   or parked as faulted with a restart hint
+// - filters system-injected messages; skips sessions without real user input
+// - deleted imports remembered (ignored state file); seen stays process-local
+// - projection warm-up so the sidebar shows real titles
 // ============================================================================
 const SEP = /[\\/]+/;
 const dirname = (p) => {
@@ -28,7 +28,7 @@ const join = (a, b) => {
 const isAbsolute = (p) => typeof p === 'string' && (/^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/') || p.startsWith('\\'));
 
 const MAX_RECORDS_PER_PASS = 30000;
-const MAPPER_VERSION = 6;
+const MAPPER_VERSION = 8;
 const STATE_FILE = 'codex-import-state.json';
 
 const SYSTEM_INJECT_MARKERS = [
@@ -116,6 +116,8 @@ return {
       recent: [],
       lastError: null,
       errors: [],
+      skipLog: [],
+      faulted: new Set(),
       files: new Map(),
       fileIds: new Map(),
       watermarkCache: new Map(),
@@ -126,6 +128,10 @@ return {
     const pushError = (entry) => {
       state.errors.push(entry);
       if (state.errors.length > 30) state.errors.shift();
+    };
+    const logSkip = (sessionId, reason) => {
+      state.skipLog.push(sessionId.slice(0, 26) + ':' + reason);
+      if (state.skipLog.length > 60) state.skipLog.shift();
     };
 
     async function dshHome() {
@@ -145,7 +151,6 @@ return {
         const info = await fs.stat(target);
         if (!info || info.type !== 'file') return;
         const o = JSON.parse(await fs.readText(target));
-        if (o && Array.isArray(o.seen)) state.mem.seen = o.seen.filter((x) => typeof x === 'string');
         if (o && Array.isArray(o.ignored)) for (const id of o.ignored) if (typeof id === 'string') state.mem.ignored.add(id);
       } catch (e) { /* no state yet */ }
     }
@@ -154,7 +159,7 @@ return {
         const home = await dshHome();
         if (!home) return;
         const target = await fs.resolve(join(home, STATE_FILE));
-        await fs.writeText(target, JSON.stringify({ version: 1, seen: state.mem.seen, ignored: [...state.mem.ignored] }));
+        await fs.writeText(target, JSON.stringify({ version: 3, ignored: [...state.mem.ignored] }));
       } catch (e) {
         console.log('codex saveState failed:', String((e && e.message) || e));
       }
@@ -277,7 +282,6 @@ return {
     function extractMeta(parsed) {
       let id = null, cwd = null, createdAt = Date.now();
       let format = 'cli';
-      let hasEventUser = false;
       for (let i = 0; i < parsed.length; i++) {
         const record = parsed[i].record;
         const t = record.type;
@@ -294,15 +298,14 @@ return {
           format = 'cli';
         }
         if (t === 'event_msg' || t === 'response_item' || t === 'turn_context') format = 'desktop';
-        if (t === 'event_msg' && record.payload && record.payload.type === 'user_message') hasEventUser = true;
       }
-      return { id, cwd, createdAt, format, useEventUserMessages: format === 'desktop' && hasEventUser };
+      return { id, cwd, createdAt, format };
     }
 
     function findWatermark(events) {
       for (let i = events.length - 1; i >= 0; i--) {
         const e = events[i];
-        if (e.type === 'codex/import' && e.data && typeof e.data.line === 'number') return e.data;
+        if (e.type === 'codex/import' && e.data) return e.data;
       }
       return null;
     }
@@ -331,10 +334,10 @@ return {
         const stream = await fs.streamText(file.target);
         for await (const chunk of stream) {
           buf += chunk;
-          let idx;
-          while ((idx = buf.indexOf('\n')) >= 0) {
-            processLine(buf.slice(0, idx));
-            buf = buf.slice(idx + 1);
+          const parts = buf.split('\n');
+          buf = parts.pop() ?? '';
+          for (const part of parts) {
+            processLine(part);
             if (parsed.length >= maxRecords) { done = true; break; }
           }
           if (done) break;
@@ -355,6 +358,7 @@ return {
       let lastCommandCallId = null;
       const stepCalls = new Set();
       const assistantSeen = new Set();
+      const userSeen = new Set();
       let firstUserText = null;
       let curTime = Date.now();
       let lastLine = fromLine - 1;
@@ -419,13 +423,20 @@ return {
         pendingResult = null;
       };
       const emitUser = (text, id, tid, forceNew) => {
-        ensureTurn(tid, forceNew);
         const t = capText(text, 120000);
+        const clean = t.trim();
+        if (!clean) return;
+        if (isDesktop) {
+          const key = hashing(clean);
+          if (userSeen.has(key)) return;
+          userSeen.add(key);
+        }
+        ensureTurn(tid, forceNew);
         if (firstUserText === null && t) firstUserText = t;
         events.push({
           type: 'user/message',
           time: curTime,
-          data: { id: id || ('codex-u-' + hashing(t)), role: 'user', content: [{ type: 'text', text: t }], source: { kind: 'user' } },
+          data: { id: id || ('codex-u-' + hashing(clean)), role: 'user', content: [{ type: 'text', text: t }], source: { kind: 'user' } },
           surfaceOp: 'append',
         });
       };
@@ -499,8 +510,10 @@ return {
           }
           if (t === 'event_msg') {
             const p = record.payload || {};
-            if (p.type === 'user_message') emitUser(p.message || '', null, undefined, false);
-            else if (p.type === 'agent_message') emitAssistant(p.message || '', null, null, null, undefined);
+            if (p.type === 'user_message') {
+              const tx = p.message || '';
+              if (!isSystemInjected(tx)) emitUser(tx, null, undefined, false);
+            } else if (p.type === 'agent_message') emitAssistant(p.message || '', null, null, null, undefined);
             else if (p.type === 'agent_reasoning' && typeof p.text === 'string' && p.text) pendingReasoning.push(p.text);
             else if (p.type === 'mcp_tool_call_end') {
               const inv = p.invocation || {};
@@ -523,7 +536,7 @@ return {
             const p = record.payload || {};
             if (p.type === 'message') {
               if (p.role === 'assistant') emitAssistant(textFromBlocks(p.content), p.id, null, null, undefined);
-              else if (p.role === 'user' && !meta.useEventUserMessages) {
+              else if (p.role === 'user') {
                 const tx = textFromBlocks(p.content);
                 if (!isSystemInjected(tx)) emitUser(tx, p.id, undefined, false);
               }
@@ -589,7 +602,6 @@ return {
         if (inspected.meta && typeof inspected.meta.createdAt === 'number') meta.createdAt = inspected.meta.createdAt;
         const session = store.prepare(sessionId, { seed: inspected.events, meta });
         await projCache.write(session);
-        console.log('codex projection warmed:', sessionId);
       } catch (e) {
         console.log('codex warm projection failed:', sessionId, String((e && e.message) || e));
       }
@@ -616,7 +628,6 @@ return {
           const title = capText(String(firstUser || (groupId && titles.get(groupId)) || filenameTitle(state.pathById.get(sessionId) || sessionId)).replace(/\s+/g, ' ').trim(), 80);
           if (title && title !== currentTitle) {
             await persistence.append(sessionId, [{ type: 'session/title', seq: inspected.events.length, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } }]);
-            console.log('codex title fixed:', sessionId, '->', title.slice(0, 40));
           }
         }
         await warmProjection(sessionId);
@@ -630,6 +641,11 @@ return {
       const sessionId = 'codex-' + (group.id ? sanitizeId(group.id) : 'file-' + sanitizeId(basename(files[0].path).replace(/\.jsonl$/i, '')));
 
       if (state.mem.ignored.has(sessionId)) {
+        logSkip(sessionId, 'ignored');
+        report.skipped++;
+        return null;
+      }
+      if (state.faulted.has(sessionId)) {
         report.skipped++;
         return null;
       }
@@ -637,6 +653,7 @@ return {
       try {
         const liveStore = ctx.get('sessions');
         if (liveStore !== undefined && typeof liveStore.get === 'function' && liveStore.get(sessionId) !== undefined) {
+          logSkip(sessionId, 'live');
           report.skipped++;
           return null;
         }
@@ -649,32 +666,24 @@ return {
         if (exists) {
           let inspected;
           try { inspected = await persistence.inspect(sessionId); } catch (e) {
+            logSkip(sessionId, 'inspect-fail');
             report.skipped++;
             return null;
           }
           const wm = findWatermark(inspected.events);
-          if (!wm) {
+          if (!wm || !wm.files || typeof wm.files !== 'object') {
+            logSkip(sessionId, 'legacy-watermark');
             report.skipped++;
             return null;
           }
-          let fi = typeof wm.fi === 'number' ? wm.fi : files.findIndex((f) => f.path === wm.src);
-          if (fi < 0 || fi >= files.length) fi = 0;
-          entry = { fi, line: wm.line, nextTurn: nextTurnFromLog(inspected.events), nextSeq: inspected.events.length, exists: true };
+          const filesMap = new Map();
+          for (const [p, line] of Object.entries(wm.files)) if (typeof line === 'number') filesMap.set(p, line);
+          entry = { files: filesMap, nextTurn: nextTurnFromLog(inspected.events), nextSeq: inspected.events.length, exists: true };
           state.watermarkCache.set(sessionId, entry);
         } else {
-          entry = { fi: 0, line: 0, nextTurn: 1, nextSeq: 0, exists: false };
+          entry = { files: new Map(), nextTurn: 1, nextSeq: 0, exists: false };
           state.watermarkCache.set(sessionId, entry);
         }
-      }
-      if (entry.fi < 0 || entry.fi >= files.length) entry.fi = files.length - 1;
-
-      const lastFile = files[files.length - 1];
-      const lastCached = state.files.get(lastFile.path);
-      if (entry.fi >= files.length - 1 && lastCached !== undefined
-        && lastCached.size !== undefined && lastFile.size !== undefined && lastCached.size === lastFile.size
-        && lastCached.eof === true && entry.line >= (lastCached.nextLine ?? Infinity)) {
-        report.skipped++;
-        return null;
       }
 
       const turnState = { nextTurn: entry.nextTurn };
@@ -682,24 +691,22 @@ return {
       const events = [];
       let meta = null;
       let firstUserText = null;
-      let fi = entry.fi;
-      let line = entry.line;
-      let consumedAll = false;
+      let progressed = false;
+      let budgetBreak = false;
 
-      while (fi < files.length) {
+      for (let fi = 0; fi < files.length; fi++) {
         const file = files[fi];
         const cached = state.files.get(file.path);
+        const consumed = entry.files.get(file.path) ?? 0;
         if (cached !== undefined && cached.size !== undefined && file.size !== undefined
-          && cached.size === file.size && cached.eof === true && line >= (cached.nextLine ?? Infinity)) {
-          if (fi === files.length - 1) { consumedAll = true; break; }
-          fi++;
-          line = 0;
+          && cached.size === file.size && cached.eof === true) {
           continue;
         }
-        const w = await readWindow(file, line, MAX_RECORDS_PER_PASS);
-        state.files.set(file.path, { size: file.size, eof: w.eof, nextLine: w.nextLine });
+        const w = await readWindow(file, consumed, MAX_RECORDS_PER_PASS);
+        state.files.set(file.path, { size: file.size, eof: w.eof });
         if (w.parsed.length === 0) {
-          if (w.eof) { fi++; line = 0; continue; }
+          if (w.eof) { entry.files.set(file.path, consumed); continue; }
+          budgetBreak = true;
           break;
         }
         const m = extractMeta(w.parsed);
@@ -707,76 +714,78 @@ return {
         const window = mapSegment(w.parsed, 0, m, turnState, MAX_RECORDS_PER_PASS);
         for (const e of window.events) events.push(e);
         if (firstUserText === null) firstUserText = window.firstUserText;
-        line = w.nextLine;
-        if (!w.eof) {
-          consumedAll = false;
-          break;
-        }
-        fi++;
-        line = 0;
+        const nl = consumed + w.parsed.length;
+        entry.files.set(file.path, nl);
+        progressed = true;
+        if (!w.eof) { budgetBreak = true; break; }
       }
-      if (fi >= files.length) {
-        fi = files.length - 1;
-        consumedAll = true;
-      }
-      const finalFi = fi;
-      const finalLine = consumedAll ? (state.files.get(files[files.length - 1].path)?.nextLine ?? line) : line;
 
       if (events.length === 0) {
-        entry.fi = finalFi;
-        entry.line = finalLine;
-        state.watermarkCache.set(sessionId, entry);
+        if (!budgetBreak) logSkip(sessionId, 'no-events');
+        return null;
+      }
+
+      if (wasNew && !events.some((e) => e.type === 'user/message') && !budgetBreak) {
+        logSkip(sessionId, 'no-user');
         report.skipped++;
         return null;
       }
 
-      if (wasNew && !events.some((e) => e.type === 'user/message')) {
-        entry.fi = finalFi;
-        entry.line = finalLine;
-        state.watermarkCache.set(sessionId, entry);
-        report.skipped++;
-        return null;
-      }
-
-      const baseSeq = entry.exists ? entry.nextSeq : 0;
-      const seqd = buildEvents(events, baseSeq);
       let title = null;
       if (wasNew) {
         title = (group.id && titles.get(group.id)) || firstUserText || filenameTitle(files[0].path);
         title = capText(String(title || '').replace(/\s+/g, ' ').trim(), 80);
-        if (title) {
-          seqd.push({ type: 'session/title', seq: baseSeq + seqd.length, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } });
-        }
       }
-      seqd.push({ type: 'codex/import', seq: baseSeq + seqd.length, time: Date.now(), data: { src: files[finalFi].path, line: finalLine, fi: finalFi, at: new Date().toISOString(), v: MAPPER_VERSION }, ignorable: true });
 
+      let baseSeq = entry.exists ? entry.nextSeq : 0;
+      let createdNow = false;
       if (wasNew) {
         const header = { version: 0, id: sessionId, createdAt: meta ? meta.createdAt : Date.now() };
         if (meta && isAbsolute(meta.cwd)) header.cwd = meta.cwd;
         try {
           await persistence.create(header);
+          createdNow = true;
         } catch (e) {
-          console.log('codex create raced:', sessionId, String(e));
-          try { const insp = await persistence.inspect(sessionId); entry.nextSeq = insp.events.length; entry.nextTurn = nextTurnFromLog(insp.events); entry.exists = true; } catch (e2) { /* ignore */ }
+          console.log('codex create raced:', sessionId, String((e && e.message) || e));
+          try {
+            const insp = await persistence.inspect(sessionId);
+            entry.exists = true;
+            entry.nextSeq = insp.events.length;
+            entry.nextTurn = nextTurnFromLog(insp.events);
+            baseSeq = insp.events.length;
+          } catch (e2) {
+            console.log('codex create raced, no stored log; appending from 0:', sessionId);
+            baseSeq = 0;
+          }
         }
       }
+
+      const seqd = buildEvents(events, baseSeq);
+      if (wasNew && title) {
+        seqd.push({ type: 'session/title', seq: baseSeq + seqd.length, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } });
+      }
+      const filesObj = {};
+      for (const [p, line] of entry.files) filesObj[p] = line;
+      seqd.push({ type: 'codex/import', seq: baseSeq + seqd.length, time: Date.now(), data: { files: filesObj, at: new Date().toISOString(), v: MAPPER_VERSION }, ignorable: true });
+
       try {
         await persistence.append(sessionId, seqd);
       } catch (e) {
         state.watermarkCache.delete(sessionId);
+        state.faulted.add(sessionId);
+        const msg = String((e && e.message) || e);
+        logSkip(sessionId, 'append:' + msg);
+        pushError({ file: files[0].path, message: sessionId + ' 持久化状态异常，请重启 DSH 后自动恢复: ' + msg });
         report.skipped++;
-        console.log('codex append skipped:', sessionId, String((e && e.message) || e));
         return null;
       }
 
       entry.exists = true;
       entry.nextSeq = baseSeq + seqd.length;
       entry.nextTurn = turnState.nextTurn;
-      entry.fi = finalFi;
-      entry.line = finalLine;
       state.watermarkCache.set(sessionId, entry);
 
-      if (wasNew) await warmProjection(sessionId);
+      if (createdNow) await warmProjection(sessionId);
 
       if (meta && isAbsolute(meta.cwd) && workspaceRegistry !== undefined) {
         try {
@@ -793,6 +802,7 @@ return {
       if (state.scanning !== null) return state.scanning;
       state.scanning = (async () => {
         state.lastError = null;
+        state.skipLog = [];
         const report = { scanned: 0, threads: 0, created: 0, updated: 0, skipped: 0, errors: 0, recent: [] };
         try {
           const root = await deriveCodexRoot();
@@ -853,8 +863,10 @@ return {
         recent: state.recent.slice(0, 20),
         lastError: state.lastError,
         errors: state.errors.slice(-10),
+        skipReasons: state.skipLog.slice(-30),
         totalFiles: state.lastScan ? state.lastScan.scanned : null,
         ignoredCount: state.mem.ignored.size,
+        faultedCount: state.faulted.size,
       };
     }
 
